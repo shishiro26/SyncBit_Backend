@@ -43,6 +43,14 @@ export function handleSocketEvents(io, socket) {
     }
   });
 
+  socket.on("leave-room", ({ roomId }) => {
+    if (!roomId) return;
+    roomManager.removeClient({ roomId, clientId: socket.id });
+
+    const clients = roomManager.getClients(roomId);
+    sendBroadcast(io, roomId, "room-update", { clients });
+  });
+
   socket.on("play-audio", ({ serverTimeToExecute, seekerPosition }) => {
     const roomId = getRoomId();
     if (!roomId) return;
