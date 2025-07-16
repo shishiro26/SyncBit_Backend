@@ -3,8 +3,10 @@ import roomManager from "../core/RoomManager.js";
 import { sendBroadcast, sendUnicast } from "../utils/broadcast.js";
 
 export function handleSocketEvents(io, socket) {
-  const getRoomId = () => Array.from(socket.rooms).find((r) => r !== socket.id);
-
+  const getRoomId = () => {
+    const rooms = Array.from(socket.rooms).filter((r) => r !== socket.id);
+    return rooms[0];
+  };
   socket.on("create-room", ({ username }) => {
     const roomId = roomManager.createRoom();
     socket.join(roomId);
@@ -18,25 +20,10 @@ export function handleSocketEvents(io, socket) {
   socket.on("join-room", ({ roomId, username }) => {
     if (!roomId) return;
     socket.join(roomId);
+    roomManager.addClient({ roomId, clientId: socket.id, username, socket });
+    sendUnicast(socket, "set-client-id", { clientId: socket.id });
 
     const room = roomManager.rooms.get(roomId);
-    if (room) {
-      const exists = Array.from(room.clients.values()).some(
-        (c) => c.username === username
-      );
-      if (!exists) {
-        roomManager.addClient({
-          roomId,
-          clientId: socket.id,
-          username,
-          socket,
-        });
-      }
-    } else {
-      roomManager.addClient({ roomId, clientId: socket.id, username, socket });
-    }
-
-    sendUnicast(socket, "set-client-id", { clientId: socket.id });
     const clients = roomManager.getClients(roomId);
     const elapsedTime = roomManager._getElapsedTime(room);
     const songDuration = room?.songDuration ?? 0;
@@ -134,9 +121,10 @@ export function handleSocketEvents(io, socket) {
   });
 
   socket.on("disconnect", () => {
-    const roomIds = Array.from(socket.rooms).filter((r) => r !== socket.id);
-    for (const roomId of roomIds) {
+    const roomId = getRoomId();
+    if (roomId) {
       roomManager.removeClient({ roomId, clientId: socket.id });
+      roomManager.clientToRoom.delete(socket.id);
       const clients = roomManager.getClients(roomId);
       sendBroadcast(io, roomId, "room-update", { clients });
     }
