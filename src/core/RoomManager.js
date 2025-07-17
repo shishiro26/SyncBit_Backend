@@ -139,9 +139,33 @@ class RoomManager {
   stopSpatialAudioLoop(roomId) {
     const room = this.rooms.get(roomId);
     if (!room) return;
+
     if (room.intervalId) {
       clearInterval(room.intervalId);
       room.intervalId = null;
+    }
+
+    room.listeningSource = { x: 0, y: 0 };
+
+    const gains = {};
+    for (const [clientId] of room.clients.entries()) {
+      gains[clientId] = 1;
+    }
+
+    const payload = {
+      source: room.listeningSource,
+      gains,
+      enabled: false,
+      positions: Object.fromEntries(
+        Array.from(room.clients.entries()).map(([id, client]) => [
+          id,
+          client.position,
+        ])
+      ),
+    };
+
+    for (const [, client] of room.clients.entries()) {
+      client.socket.emit("spatial-update", payload);
     }
   }
 
@@ -161,6 +185,7 @@ class RoomManager {
     const payload = {
       source,
       gains,
+      enabled: room.spatialEnabled,
       positions: Object.fromEntries(
         Array.from(room.clients.entries()).map(([id, client]) => [
           id,
