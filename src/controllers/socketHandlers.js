@@ -1,7 +1,5 @@
 import roomManager from "../services/RoomManager.js";
 import { sendUnicast, sendBroadCast } from "../utils/broadcast.js";
-import ntpManager from "../services/TimeManager.js";
-import ntpClient from "ntp-client";
 
 const handleSocketEvents = (io, socket) => {
   const getRoomId = () => {
@@ -94,96 +92,50 @@ const handleSocketEvents = (io, socket) => {
     }
   });
 
-  socket.on(
-    "play-audio",
-    async ({ serverTimeToExecute, songDuration, songUrl }) => {
-      const roomId = getRoomId();
-      if (!roomId) return;
-
-      try {
-        const currentServerTime = ntpManager.getServerTime();
-        const executeTime = serverTimeToExecute || currentServerTime;
-        const delay = Math.max(0, executeTime - currentServerTime);
-
-        let elapsedTime = 0;
-        if (delay === 0) {
-          elapsedTime = 0;
-        }
-
-        setTimeout(async () => {
-          await roomManager.playAudio(roomId, true, elapsedTime, songDuration);
-
-          const payload = {
-            action: "play",
-            serverTime: ntpManager.getServerTime(),
-            songDuration,
-            songUrl,
-            elapsedTime,
-          };
-
-          sendBroadCast(io, roomId, "audio-command", payload);
-        }, delay);
-      } catch (error) {
-        console.error("Error playing audio:", error);
-        sendUnicast(socket, "error", { message: "Failed to play audio" });
-      }
-    }
-  );
-
-  socket.on("pause-audio", async ({ serverTimeToExecute }) => {
+  socket.on("play-audio", async ({ songDuration, audioUrl, elapsedTime }) => {
     const roomId = getRoomId();
     if (!roomId) return;
 
     try {
-      const currentServerTime = ntpManager.getServerTime();
-      const executeTime = serverTimeToExecute || currentServerTime;
-      const delay = Math.max(0, executeTime - currentServerTime);
+      await roomManager.playAudio(
+        roomId,
+        true,
+        elapsedTime,
+        songDuration,
+        "https://res.cloudinary.com/dor4hhdzh/video/upload/v1753204341/spinning-head-271171_qoxlyz.mp3"
+      );
+    } catch (error) {
+      console.error("Error playing audio:", error);
+      sendUnicast(socket, "error", { message: "Failed to play audio" });
+    }
+  });
 
-      setTimeout(async () => {
-        await roomManager.pauseAudio(roomId);
+  socket.on("pause-audio", async () => {
+    const roomId = getRoomId();
+    if (!roomId) return;
 
-        const payload = {
-          action: "pause",
-          serverTime: ntpManager.getServerTime(),
-        };
-
-        sendBroadCast(io, roomId, "audio-command", payload);
-      }, delay);
+    try {
+      await roomManager.playAudio(roomId, false);
     } catch (error) {
       console.error("Error pausing audio:", error);
       sendUnicast(socket, "error", { message: "Failed to pause audio" });
     }
   });
 
-  socket.on("seek-audio", async ({ position, serverTimeToExecute }) => {
+  socket.on("seek-audio", async ({ position }) => {
     const roomId = getRoomId();
     if (!roomId) return;
 
     try {
-      const currentServerTime = ntpManager.getServerTime();
-      const executeTime = serverTimeToExecute || currentServerTime;
-      const delay = Math.max(0, executeTime - currentServerTime);
+      const room = await roomManager.getRoom(roomId);
+      if (!room) return;
 
-      setTimeout(async () => {
-        const room = await roomManager.getRoom(roomId);
-        if (!room) return;
-
-        await roomManager.playAudio(
-          roomId,
-          room.songEnabled,
-          position,
-          room.songDuration
-        );
-
-        const payload = {
-          action: "seek",
-          position,
-          serverTime: ntpManager.getServerTime(),
-          songEnabled: room.songEnabled,
-        };
-
-        sendBroadCast(io, roomId, "audio-command", payload);
-      }, delay);
+      await roomManager.playAudio(
+        roomId,
+        room.songEnabled,
+        position,
+        room.songDuration
+      );
     } catch (error) {
       console.error("Error seeking audio:", error);
       sendUnicast(socket, "error", { message: "Failed to seek audio" });
@@ -204,6 +156,18 @@ const handleSocketEvents = (io, socket) => {
     }
   });
 
+  socket.on("update-source", async ({ position }) => {
+    const roomId = getRoomId();
+    if (!roomId) return;
+
+    try {
+      await roomManager.updateSourcePosition(roomId, position);
+    } catch (error) {
+      console.error("Error updating source:", error);
+      sendUnicast(socket, "error", { message: "Failed to update source" });
+    }
+  });
+
   socket.on("get-room-state", async () => {
     const roomId = getRoomId();
     if (!roomId) return;
@@ -219,8 +183,11 @@ const handleSocketEvents = (io, socket) => {
           spatialEnabled: room.spatialEnabled,
           songEnabled: room.songEnabled,
           songDuration: room.songDuration,
-          elapsedTime: await roomManager._getElapsedTime(room),
-          serverTime: ntpManager.getServerTime(),
+          elapsedTime: roomManager._getElapsedTimeSync(room),
+          serverTime: roomManager.getServerTime(),
+          playlistUrl: room.hlsPlaylistUrl,
+          audioUrl: room.audioUrl,
+          listeningSource: room.listeningSource,
         };
 
         sendUnicast(socket, "room-state", state);
@@ -231,41 +198,18 @@ const handleSocketEvents = (io, socket) => {
     }
   });
 
-  socket.on("ntp-request", ({ t0 }) => {
-    const t1 = Date.now();
+  socket.on("request-resync", async () => {
+    const roomId = getRoomId();
+    if (!roomId) return;
 
-    ntpClient.getNetworkTime("pool.ntp.org", 123, (err, date) => {
-      const t2 = Date.now();
-      const ntpT1 = err ? t1 : date.getTime();
-      const ntpT2 = err ? t2 : date.getTime();
-
-      socket.emit("ntp-response", {
-        t0,
-        t1: ntpT1,
-        t2: ntpT2,
-        serverTime: ntpManager.getServerTime(),
-        offset: ntpManager.ntpOffset,
-      });
-    });
-  });
-
-  socket.on("sync-request", () => {
-    socket.emit("sync-response", {
-      serverTime: ntpManager.getServerTime(),
-      offset: ntpManager.ntpOffset,
-      lastSync: ntpManager.lastSync,
-    });
-  });
-
-  socket.on("force-ntp-sync", async () => {
     try {
-      await ntpManager.syncWithNTP();
-      socket.emit("ntp-sync-complete", {
-        offset: ntpManager.ntpOffset,
-        serverTime: ntpManager.getServerTime(),
-      });
+      const room = await roomManager.getRoom(roomId);
+      if (!room || !room.songEnabled) return;
+
+      await roomManager.sendLateJoinerSync(socket.id, room);
     } catch (error) {
-      socket.emit("ntp-sync-error", { error: error.message });
+      console.error("Error handling resync request:", error);
+      sendUnicast(socket, "error", { message: "Failed to resync" });
     }
   });
 };

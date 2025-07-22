@@ -1,13 +1,107 @@
 import redis from "../config/redis.js";
 import { RADIUS } from "../constants/index.js";
+import ffmpeg from "fluent-ffmpeg";
+import fs from "fs";
+import path from "path";
 
 class RoomManager {
   constructor() {
     this.sockets = new Map();
     this.intervals = new Map();
+    this.hlsStreams = new Map();
+    this.outputDir = "./hls_output";
+    this.ensureDirectoryExists();
   }
+
+  ensureDirectoryExists() {
+    if (!fs.existsSync(this.outputDir)) {
+      fs.mkdirSync(this.outputDir, { recursive: true });
+    }
+  }
+
   getServerTime() {
     return Date.now();
+  }
+
+  async processAudioToHLS(audioUrl, roomId) {
+    const outputPath = path.join(this.outputDir, roomId);
+
+    if (!fs.existsSync(outputPath)) {
+      fs.mkdirSync(outputPath, { recursive: true });
+    }
+
+    return new Promise((resolve, reject) => {
+      ffmpeg(audioUrl)
+        .audioCodec("aac")
+        .audioBitrate("128k")
+        .audioChannels(2)
+        .audioFrequency(44100)
+        .outputOptions([
+          "-f hls",
+          "-hls_time 8",
+          "-hls_list_size 0",
+          "-hls_segment_type mpegts",
+          "-hls_flags independent_segments",
+        ])
+        .output(path.join(outputPath, "playlist.m3u8"))
+        .on("end", () => {
+          const playlistPath = path.join(outputPath, "playlist.m3u8");
+          const duration = this.getAudioDuration(playlistPath);
+          const segments = this.parseM3U8Segments(playlistPath);
+
+          resolve({
+            playlistUrl: `/hls/${roomId}/playlist.m3u8`,
+            duration,
+            segments,
+            outputPath,
+          });
+        })
+        .on("error", reject)
+        .run();
+    });
+  }
+
+  parseM3U8Segments(playlistPath) {
+    const content = fs.readFileSync(playlistPath, "utf8");
+    const lines = content.split("\n");
+    const segments = [];
+    let currentTime = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+
+      if (line.startsWith("#EXTINF:")) {
+        const duration = parseFloat(line.split(":")[1].split(",")[0]) * 1000; // ms
+        const segmentFile = lines[i + 1]?.trim();
+
+        if (segmentFile && !segmentFile.startsWith("#")) {
+          segments.push({
+            file: segmentFile,
+            duration,
+            startTime: currentTime,
+            endTime: currentTime + duration,
+          });
+          currentTime += duration;
+        }
+      }
+    }
+
+    return segments;
+  }
+
+  getAudioDuration(playlistPath) {
+    const segments = this.parseM3U8Segments(playlistPath);
+    return segments.reduce((total, seg) => total + seg.duration, 0);
+  }
+
+  getSegmentForTime(roomId, elapsedTime) {
+    const hlsData = this.hlsStreams.get(roomId);
+    if (!hlsData?.segments) return null;
+
+    return hlsData.segments.find(
+      (segment) =>
+        elapsedTime >= segment.startTime && elapsedTime < segment.endTime
+    );
   }
 
   async initRoom(roomId) {
@@ -19,6 +113,8 @@ class RoomManager {
       startTime: null,
       songDuration: 0,
       listeningSource: { x: 0, y: 0 },
+      hlsPlaylistUrl: null,
+      audioUrl: null,
       createdAt: this.getServerTime(),
       lastUpdated: this.getServerTime(),
     };
@@ -40,6 +136,11 @@ class RoomManager {
     return data ? JSON.parse(data) : null;
   }
 
+  async saveRoom(roomId, room) {
+    room.lastUpdated = this.getServerTime();
+    await redis.set(this._roomKey(roomId), JSON.stringify(room));
+  }
+
   async getClients(roomId) {
     const room = await this.getRoom(roomId);
     if (!room) return [];
@@ -50,14 +151,16 @@ class RoomManager {
     }));
   }
 
-  async saveRoom(roomId, room) {
-    room.lastUpdated = this.getServerTime();
-    await redis.set(this._roomKey(roomId), JSON.stringify(room));
-  }
-
   async deleteRoom(roomId) {
     clearInterval(this.intervals.get(roomId));
     this.intervals.delete(roomId);
+
+    const outputPath = path.join(this.outputDir, roomId);
+    if (fs.existsSync(outputPath)) {
+      fs.rmSync(outputPath, { recursive: true, force: true });
+    }
+    this.hlsStreams.delete(roomId);
+
     const room = await this.getRoom(roomId);
     if (room) {
       Object.keys(room.clients).forEach((clientId) =>
@@ -73,6 +176,7 @@ class RoomManager {
       room = await this.initRoom(roomId);
     }
 
+    // Remove existing client with same username
     for (const [id, client] of Object.entries(room.clients)) {
       if (client.username === username) {
         delete room.clients[id];
@@ -80,20 +184,64 @@ class RoomManager {
       }
     }
 
+    const isLateJoiner = room.songEnabled;
     room.clients[clientId] = {
       position: { x: 0, y: 0 },
       username,
       joinedAt: this.getServerTime(),
+      lateJoiner: isLateJoiner,
     };
 
     this.sockets.set(clientId, socket);
-
     await this.updateClientPositions(room);
     await this.saveRoom(roomId, room);
-    await this._sendCompleteStateToClient(socket, room);
-    await this.broadcastSpatialUpdate(room);
 
+    // Send initial state
+    await this._sendCompleteStateToClient(socket, room);
+
+    // Handle late joiner sync
+    if (isLateJoiner && room.hlsPlaylistUrl) {
+      await this.sendLateJoinerSync(clientId, room);
+    }
+
+    await this.broadcastSpatialUpdate(room);
     return room;
+  }
+
+  // Late joiner synchronization
+  async sendLateJoinerSync(clientId, room) {
+    const socket = this.sockets.get(clientId);
+    if (!socket) return;
+
+    const currentElapsedTime = this._getElapsedTimeSync(room);
+    const currentSegment = this.getSegmentForTime(
+      room.roomId,
+      currentElapsedTime
+    );
+
+    if (!currentSegment) {
+      console.warn(
+        `No segment found for time ${currentElapsedTime}ms in room ${room.roomId}`
+      );
+      return;
+    }
+
+    const segmentOffset = currentElapsedTime - currentSegment.startTime;
+
+    socket.emit("late-joiner-sync", {
+      playlistUrl: room.hlsPlaylistUrl,
+      audioUrl: room.audioUrl,
+      currentSegment: currentSegment,
+      segmentOffset: segmentOffset,
+      totalElapsedTime: currentElapsedTime,
+      serverTime: this.getServerTime(),
+      songDuration: room.songDuration,
+      spatialEnabled: room.spatialEnabled,
+      sourcePosition: room.listeningSource,
+      userPositions: Object.fromEntries(
+        Object.entries(room.clients).map(([id, c]) => [id, c.position])
+      ),
+    });
   }
 
   async removeClient({ roomId, clientId }) {
@@ -112,42 +260,62 @@ class RoomManager {
     }
   }
 
-  async playAudio(roomId, enable, elapsedTime, songDuration) {
+  async playAudio(roomId, enable, elapsedTime, songDuration, audioUrl = null) {
     const room = await this.getRoom(roomId);
     if (!room) return;
 
+    if (audioUrl && enable) {
+      try {
+        console.log(`Processing audio to HLS for room ${roomId}`);
+        const hlsData = await this.processAudioToHLS(audioUrl, roomId);
+
+        room.hlsPlaylistUrl = hlsData.playlistUrl;
+        room.audioUrl = audioUrl;
+        room.songDuration = hlsData.duration;
+
+        this.hlsStreams.set(roomId, hlsData);
+        console.log(`HLS processing complete: ${hlsData.duration}ms duration`);
+      } catch (error) {
+        console.error("Failed to process audio to HLS:", error);
+        throw new Error("Audio processing failed");
+      }
+    }
+
     room.songEnabled = enable;
-    if (songDuration) room.songDuration = songDuration;
 
     if (enable) {
       const resumeFrom = elapsedTime ?? room.savedElapsedTime ?? 0;
       room.startTime = this.getServerTime() - resumeFrom;
       room.savedElapsedTime = 0;
     } else {
-      const elapsed = await this._getElapsedTime(room);
-      room.savedElapsedTime = elapsed;
+      room.savedElapsedTime = this._getElapsedTimeSync(room);
       room.startTime = null;
     }
 
     await this.saveRoom(roomId, room);
-    await this.broadcastCompleteState(room);
-
+    await this.broadcastHLSCommand(room, enable);
     return enable;
   }
 
-  async pauseAudio(roomId) {
-    const room = await this.getRoom(roomId);
-    if (!room) return;
+  // Broadcast HLS-specific commands
+  async broadcastHLSCommand(room, enable) {
+    const payload = {
+      action: enable ? "play" : "pause",
+      serverTime: this.getServerTime(),
+      startTime: room.startTime,
+      elapsedTime: this._getElapsedTimeSync(room),
+      songDuration: room.songDuration,
+      playlistUrl: room.hlsPlaylistUrl,
+      audioUrl: room.audioUrl,
+      spatialEnabled: room.spatialEnabled,
+    };
 
-    room.songEnabled = false;
-    const elapsed = await this._getElapsedTime(room);
-    room.savedElapsedTime = elapsed;
-    room.startTime = null;
-
-    await this.saveRoom(roomId, room);
-    await this.broadcastCompleteState(room);
-
-    return false;
+    for (const clientId of Object.keys(room.clients)) {
+      const socket = this.sockets.get(clientId);
+      if (socket) {
+        socket.emit("hls-command", payload);
+      }
+    }
   }
 
   async toggleSpatialAudio(roomId, enable) {
@@ -202,6 +370,16 @@ class RoomManager {
     await this.saveRoom(roomId, room);
   }
 
+  async updateSourcePosition(roomId, position) {
+    const room = await this.getRoom(roomId);
+    if (!room) return;
+
+    room.listeningSource = position;
+    await this.saveRoom(roomId, room);
+    await this.broadcastSpatialUpdate(room);
+    return room.listeningSource;
+  }
+
   async updateClientPositions(room) {
     const clientEntries = Object.entries(room.clients);
     clientEntries.forEach(([id, client], index) => {
@@ -231,10 +409,11 @@ class RoomManager {
       gains,
       enabled: room.spatialEnabled,
       songEnabled: room.songEnabled,
-      elapsedTime: await this._getElapsedTime(room),
+      elapsedTime: this._getElapsedTimeSync(room),
       songDuration: room.songDuration,
       startTime: room.startTime,
       serverTime: this.getServerTime(),
+      playlistUrl: room.hlsPlaylistUrl,
       positions: Object.fromEntries(
         Object.entries(room.clients).map(([id, c]) => [id, c.position])
       ),
@@ -248,32 +427,10 @@ class RoomManager {
     }
   }
 
-  async broadcastCompleteState(room) {
-    const currentTime = this.getServerTime();
-    const payload = {
-      songEnabled: room.songEnabled,
-      spatialEnabled: room.spatialEnabled,
-      elapsedTime: await this._getElapsedTime(room),
-      songDuration: room.songDuration,
-      startTime: room.startTime,
-      serverTime: currentTime,
-      savedElapsedTime: room.savedElapsedTime,
-    };
-
-    for (const clientId of Object.keys(room.clients)) {
-      const socket = this.sockets.get(clientId);
-      if (socket) {
-        socket.emit("complete-state-update", payload);
-      }
-    }
-
-    await this.broadcastSpatialUpdate(room);
-  }
-
   async _sendCompleteStateToClient(socket, room) {
     const currentTime = this.getServerTime();
 
-    const songPayload = {
+    const initialPayload = {
       songEnabled: room.songEnabled,
       elapsedTime: this._getElapsedTimeSync(room),
       songDuration: room.songDuration,
@@ -281,10 +438,14 @@ class RoomManager {
       serverTime: currentTime,
       savedElapsedTime: room.savedElapsedTime,
       spatialEnabled: room.spatialEnabled,
+      playlistUrl: room.hlsPlaylistUrl,
+      audioUrl: room.audioUrl,
+      sourcePosition: room.listeningSource,
     };
 
-    socket.emit("initial-sync", songPayload);
+    socket.emit("initial-sync", initialPayload);
 
+    // Send spatial update
     const gains = {};
     for (const [clientId, client] of Object.entries(room.clients)) {
       if (room.spatialEnabled) {
@@ -304,28 +465,13 @@ class RoomManager {
       songDuration: room.songDuration,
       startTime: room.startTime,
       serverTime: currentTime,
+      playlistUrl: room.hlsPlaylistUrl,
       positions: Object.fromEntries(
         Object.entries(room.clients).map(([id, c]) => [id, c.position])
       ),
     };
 
     socket.emit("spatial-update", spatialPayload);
-  }
-
-  async broadcastSongState(room) {
-    await this.broadcastCompleteState(room);
-  }
-
-  _sendSongStateToClient(socket, room) {
-    this._sendCompleteStateToClient(socket, room);
-  }
-
-  _getElapsedTimeSync(room) {
-    if (!room) return 0;
-    if (room.songEnabled && room.startTime) {
-      return Math.min(this.getServerTime() - room.startTime, room.songDuration);
-    }
-    return room.savedElapsedTime || 0;
   }
 
   _roomKey(roomId) {
@@ -347,7 +493,7 @@ class RoomManager {
     return Math.max(gain, minGain);
   }
 
-  async _getElapsedTime(room) {
+  _getElapsedTimeSync(room) {
     if (!room) return 0;
     if (room.songEnabled && room.startTime) {
       return Math.min(this.getServerTime() - room.startTime, room.songDuration);
