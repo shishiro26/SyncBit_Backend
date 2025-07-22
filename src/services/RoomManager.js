@@ -71,7 +71,7 @@ class RoomManager {
       const line = lines[i].trim();
 
       if (line.startsWith("#EXTINF:")) {
-        const duration = parseFloat(line.split(":")[1].split(",")[0]) * 1000; // ms
+        const duration = parseFloat(line.split(":")[1].split(",")[0]) * 1000;
         const segmentFile = lines[i + 1]?.trim();
 
         if (segmentFile && !segmentFile.startsWith("#")) {
@@ -176,7 +176,6 @@ class RoomManager {
       room = await this.initRoom(roomId);
     }
 
-    // Remove existing client with same username
     for (const [id, client] of Object.entries(room.clients)) {
       if (client.username === username) {
         delete room.clients[id];
@@ -196,10 +195,8 @@ class RoomManager {
     await this.updateClientPositions(room);
     await this.saveRoom(roomId, room);
 
-    // Send initial state
     await this._sendCompleteStateToClient(socket, room);
 
-    // Handle late joiner sync
     if (isLateJoiner && room.hlsPlaylistUrl) {
       await this.sendLateJoinerSync(clientId, room);
     }
@@ -208,7 +205,6 @@ class RoomManager {
     return room;
   }
 
-  // Late joiner synchronization
   async sendLateJoinerSync(clientId, room) {
     const socket = this.sockets.get(clientId);
     if (!socket) return;
@@ -297,7 +293,6 @@ class RoomManager {
     return enable;
   }
 
-  // Broadcast HLS-specific commands
   async broadcastHLSCommand(room, enable) {
     const payload = {
       action: enable ? "play" : "pause",
@@ -445,7 +440,6 @@ class RoomManager {
 
     socket.emit("initial-sync", initialPayload);
 
-    // Send spatial update
     const gains = {};
     for (const [clientId, client] of Object.entries(room.clients)) {
       if (room.spatialEnabled) {
