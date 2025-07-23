@@ -3,12 +3,14 @@ import http from "node:http";
 import cors from "cors";
 import ntpClient from "ntp-client";
 import setupSocket from "./config/socket.js";
+import uploadRoutes from "./routes/upload.js";
 
 const app = express();
 const server = http.createServer(app);
 
 app.use(cors());
 app.use(express.json());
+app.use("/api/v1", uploadRoutes);
 
 app.get("/ntp", (req, res) => {
   ntpClient.getNetworkTime("pool.ntp.org", 123, (err, date) => {

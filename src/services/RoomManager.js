@@ -1,122 +1,46 @@
 import redis from "../config/redis.js";
 import { RADIUS } from "../constants/index.js";
 import ffmpeg from "fluent-ffmpeg";
-import fs from "fs";
 import path from "path";
+import fs from "fs/promises";
+import { fileURLToPath } from "url";
+import ffmpegPath from "@ffmpeg-installer/ffmpeg";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+ffmpeg.setFfmpegPath(ffmpegPath.path);
 
 class RoomManager {
   constructor() {
     this.sockets = new Map();
     this.intervals = new Map();
-    this.hlsStreams = new Map();
-    this.outputDir = "./hls_output";
-    this.ensureDirectoryExists();
+    this.syncIntervals = new Map();
+    this.hlsOutputDir = path.join(__dirname, "../public/hls");
+    this._ensureHLSDirectory();
   }
 
-  ensureDirectoryExists() {
-    if (!fs.existsSync(this.outputDir)) {
-      fs.mkdirSync(this.outputDir, { recursive: true });
+  async _ensureHLSDirectory() {
+    try {
+      await fs.mkdir(this.hlsOutputDir, { recursive: true });
+    } catch (error) {
+      console.error("Error creating HLS directory:", error);
     }
-  }
-
-  getServerTime() {
-    return Date.now();
-  }
-
-  async processAudioToHLS(audioUrl, roomId) {
-    const outputPath = path.join(this.outputDir, roomId);
-
-    if (!fs.existsSync(outputPath)) {
-      fs.mkdirSync(outputPath, { recursive: true });
-    }
-
-    return new Promise((resolve, reject) => {
-      ffmpeg(audioUrl)
-        .audioCodec("aac")
-        .audioBitrate("128k")
-        .audioChannels(2)
-        .audioFrequency(44100)
-        .outputOptions([
-          "-f hls",
-          "-hls_time 8",
-          "-hls_list_size 0",
-          "-hls_segment_type mpegts",
-          "-hls_flags independent_segments",
-        ])
-        .output(path.join(outputPath, "playlist.m3u8"))
-        .on("end", () => {
-          const playlistPath = path.join(outputPath, "playlist.m3u8");
-          const duration = this.getAudioDuration(playlistPath);
-          const segments = this.parseM3U8Segments(playlistPath);
-
-          resolve({
-            playlistUrl: `/hls/${roomId}/playlist.m3u8`,
-            duration,
-            segments,
-            outputPath,
-          });
-        })
-        .on("error", reject)
-        .run();
-    });
-  }
-
-  parseM3U8Segments(playlistPath) {
-    const content = fs.readFileSync(playlistPath, "utf8");
-    const lines = content.split("\n");
-    const segments = [];
-    let currentTime = 0;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-
-      if (line.startsWith("#EXTINF:")) {
-        const duration = parseFloat(line.split(":")[1].split(",")[0]) * 1000;
-        const segmentFile = lines[i + 1]?.trim();
-
-        if (segmentFile && !segmentFile.startsWith("#")) {
-          segments.push({
-            file: segmentFile,
-            duration,
-            startTime: currentTime,
-            endTime: currentTime + duration,
-          });
-          currentTime += duration;
-        }
-      }
-    }
-
-    return segments;
-  }
-
-  getAudioDuration(playlistPath) {
-    const segments = this.parseM3U8Segments(playlistPath);
-    return segments.reduce((total, seg) => total + seg.duration, 0);
-  }
-
-  getSegmentForTime(roomId, elapsedTime) {
-    const hlsData = this.hlsStreams.get(roomId);
-    if (!hlsData?.segments) return null;
-
-    return hlsData.segments.find(
-      (segment) =>
-        elapsedTime >= segment.startTime && elapsedTime < segment.endTime
-    );
   }
 
   async initRoom(roomId) {
     const room = {
       clients: {},
+      songs: {},
+      currentSong: null,
+      songElapsedTime: 0,
+      songStartTime: null,
+      isPlaying: false,
+      playbackStartTime: null,
+      serverTime: null,
+      soundSource: { x: 0, y: 0 },
       spatialEnabled: false,
-      songEnabled: false,
-      savedElapsedTime: 0,
-      startTime: null,
-      songDuration: 0,
-      listeningSource: { x: 0, y: 0 },
-      hlsPlaylistUrl: null,
-      audioUrl: null,
-      createdAt: this.getServerTime(),
-      lastUpdated: this.getServerTime(),
+      hlsUrl: null,
+      playbackRate: 1.0,
     };
     await redis.set(this._roomKey(roomId), JSON.stringify(room));
     return room;
@@ -132,42 +56,40 @@ class RoomManager {
   }
 
   async getRoom(roomId) {
-    const data = await redis.get(this._roomKey(roomId));
-    return data ? JSON.parse(data) : null;
-  }
-
-  async saveRoom(roomId, room) {
-    room.lastUpdated = this.getServerTime();
-    await redis.set(this._roomKey(roomId), JSON.stringify(room));
+    const room = await redis.get(this._roomKey(roomId));
+    return room ? JSON.parse(room) : null;
   }
 
   async getClients(roomId) {
     const room = await this.getRoom(roomId);
-    if (!room) return [];
-    return Object.entries(room.clients).map(([clientId, client]) => ({
-      clientId,
+    if (!room) {
+      return [];
+    }
+
+    return Object.entries(room.clients).map(([id, client]) => ({
+      id,
       username: client.username,
       position: client.position,
     }));
   }
 
-  async deleteRoom(roomId) {
-    clearInterval(this.intervals.get(roomId));
-    this.intervals.delete(roomId);
-
-    const outputPath = path.join(this.outputDir, roomId);
-    if (fs.existsSync(outputPath)) {
-      fs.rmSync(outputPath, { recursive: true, force: true });
-    }
-    this.hlsStreams.delete(roomId);
-
+  async getSongs(roomId) {
     const room = await this.getRoom(roomId);
-    if (room) {
-      Object.keys(room.clients).forEach((clientId) =>
-        this.sockets.delete(clientId)
-      );
+    if (!room) {
+      return [];
     }
-    await redis.del(this._roomKey(roomId));
+
+    return Object.entries(room.songs).map(([id, song]) => ({
+      id,
+      songUrl: song.songUrl,
+      hlsUrl: song.hlsUrl,
+      uploadedAt: song.uploadedAt,
+      duration: song.duration,
+    }));
+  }
+
+  async saveRoom(roomId, room) {
+    await redis.set(this._roomKey(roomId), JSON.stringify(room));
   }
 
   async addClient({ roomId, username, clientId, socket }) {
@@ -176,6 +98,7 @@ class RoomManager {
       room = await this.initRoom(roomId);
     }
 
+    // Remove existing client with same username
     for (const [id, client] of Object.entries(room.clients)) {
       if (client.username === username) {
         delete room.clients[id];
@@ -183,202 +106,463 @@ class RoomManager {
       }
     }
 
-    const isLateJoiner = room.songEnabled;
     room.clients[clientId] = {
-      position: { x: 0, y: 0 },
       username,
-      joinedAt: this.getServerTime(),
-      lateJoiner: isLateJoiner,
+      position: { x: 0, y: 0 },
+      joinedAt: Date.now(),
+      lastSyncTime: Date.now(),
+      latency: 0,
     };
 
     this.sockets.set(clientId, socket);
-    await this.updateClientPositions(room);
+    this.updateClientPositions(room);
     await this.saveRoom(roomId, room);
+    await this.broadCastSpatialUpdate(room);
 
-    await this._sendCompleteStateToClient(socket, room);
-
-    if (isLateJoiner && room.hlsPlaylistUrl) {
-      await this.sendLateJoinerSync(clientId, room);
+    // Start sync for this room if not already started
+    if (!this.syncIntervals.has(roomId)) {
+      this.startSyncBroadcast(roomId);
     }
 
-    await this.broadcastSpatialUpdate(room);
-    return room;
-  }
+    const currentPlaybackTime = this._calculateCurrentPlaybackTime(room);
 
-  async sendLateJoinerSync(clientId, room) {
-    const socket = this.sockets.get(clientId);
-    if (!socket) return;
-
-    const currentElapsedTime = this._getElapsedTimeSync(room);
-    const currentSegment = this.getSegmentForTime(
-      room.roomId,
-      currentElapsedTime
-    );
-
-    if (!currentSegment) {
-      console.warn(
-        `No segment found for time ${currentElapsedTime}ms in room ${room.roomId}`
-      );
-      return;
-    }
-
-    const segmentOffset = currentElapsedTime - currentSegment.startTime;
-
-    socket.emit("late-joiner-sync", {
-      playlistUrl: room.hlsPlaylistUrl,
-      audioUrl: room.audioUrl,
-      currentSegment: currentSegment,
-      segmentOffset: segmentOffset,
-      totalElapsedTime: currentElapsedTime,
-      serverTime: this.getServerTime(),
-      songDuration: room.songDuration,
-      spatialEnabled: room.spatialEnabled,
-      sourcePosition: room.listeningSource,
-      userPositions: Object.fromEntries(
-        Object.entries(room.clients).map(([id, c]) => [id, c.position])
-      ),
-    });
+    return {
+      currentSong: room.currentSong,
+      isPlaying: room.isPlaying,
+      songElapsedTime: currentPlaybackTime,
+      playbackStartTime: room.playbackStartTime,
+      serverTime: Date.now(),
+      hlsUrl: room.hlsUrl,
+      songs: Object.entries(room.songs).map(([id, song]) => ({
+        id,
+        songUrl: song.songUrl,
+        hlsUrl: song.hlsUrl,
+        uploadedAt: song.uploadedAt,
+        duration: song.duration,
+      })),
+    };
   }
 
   async removeClient({ roomId, clientId }) {
     const room = await this.getRoom(roomId);
-    if (!room) return;
+    if (!room) {
+      return;
+    }
 
     delete room.clients[clientId];
     this.sockets.delete(clientId);
 
     if (Object.keys(room.clients).length === 0) {
-      await this.deleteRoom(roomId);
+      // Clear all intervals before deleting room
+      if (this.intervals.has(roomId)) {
+        clearInterval(this.intervals.get(roomId));
+        this.intervals.delete(roomId);
+      }
+      if (this.syncIntervals.has(roomId)) {
+        clearInterval(this.syncIntervals.get(roomId));
+        this.syncIntervals.delete(roomId);
+      }
+      await redis.del(this._roomKey(roomId));
     } else {
-      await this.updateClientPositions(room);
+      this.updateClientPositions(room);
       await this.saveRoom(roomId, room);
-      await this.broadcastSpatialUpdate(room);
     }
   }
 
-  async playAudio(roomId, enable, elapsedTime, songDuration, audioUrl = null) {
+  // Convert audio URL to HLS using fluent-ffmpeg
+  async uploadSong(roomId, audioUrl) {
     const room = await this.getRoom(roomId);
-    if (!room) return;
-
-    if (audioUrl && enable) {
-      try {
-        console.log(`Processing audio to HLS for room ${roomId}`);
-        const hlsData = await this.processAudioToHLS(audioUrl, roomId);
-
-        room.hlsPlaylistUrl = hlsData.playlistUrl;
-        room.audioUrl = audioUrl;
-        room.songDuration = hlsData.duration;
-
-        this.hlsStreams.set(roomId, hlsData);
-        console.log(`HLS processing complete: ${hlsData.duration}ms duration`);
-      } catch (error) {
-        console.error("Failed to process audio to HLS:", error);
-        throw new Error("Audio processing failed");
-      }
+    if (!room) {
+      throw new Error("Room not found");
     }
 
-    room.songEnabled = enable;
+    const songId = `song_${Date.now()}_${Math.random()
+      .toString(36)
+      .substring(2, 9)}`;
 
-    if (enable) {
-      const resumeFrom = elapsedTime ?? room.savedElapsedTime ?? 0;
-      room.startTime = this.getServerTime() - resumeFrom;
-      room.savedElapsedTime = 0;
-    } else {
-      room.savedElapsedTime = this._getElapsedTimeSync(room);
-      room.startTime = null;
+    console.log(`Converting audio to HLS for song: ${songId}`);
+    console.log(`Audio URL: ${audioUrl}`);
+
+    try {
+      // Create HLS stream from audio URL
+      const { hlsUrl, duration } = await this._convertToHLS(audioUrl, songId);
+
+      room.songs[songId] = {
+        songUrl: audioUrl,
+        hlsUrl: hlsUrl,
+        uploadedAt: Date.now(),
+        duration: duration,
+      };
+
+      await this.saveRoom(roomId, room);
+
+      console.log(`Successfully converted song ${songId} to HLS`);
+
+      return {
+        id: songId,
+        songUrl: audioUrl,
+        hlsUrl: hlsUrl,
+        uploadedAt: room.songs[songId].uploadedAt,
+        duration: duration,
+      };
+    } catch (error) {
+      console.error("Error converting to HLS:", error);
+      throw new Error(`Failed to process audio file: ${error.message}`);
     }
+  }
+
+  async removeSong(roomId, songId) {
+    const room = await this.getRoom(roomId);
+    if (!room) {
+      throw new Error("Room not found");
+    }
+
+    if (!room.songs[songId]) {
+      throw new Error("Song not found");
+    }
+
+    if (room.currentSong === songId) {
+      room.currentSong = null;
+      room.isPlaying = false;
+      room.songElapsedTime = 0;
+      room.songStartTime = null;
+      room.playbackStartTime = null;
+      room.hlsUrl = null;
+    }
+
+    // Clean up HLS files
+    if (room.songs[songId].hlsUrl) {
+      await this._cleanupHLS(songId);
+    }
+
+    delete room.songs[songId];
+    await this.saveRoom(roomId, room);
+
+    return songId;
+  }
+
+  // Convert audio URL to HLS using fluent-ffmpeg
+  async _convertToHLS(audioUrl, songId) {
+    return new Promise((resolve, reject) => {
+      const outputDir = path.join(this.hlsOutputDir, songId);
+      const playlistPath = path.join(outputDir, "playlist.m3u8");
+      const segmentPattern = path.join(outputDir, "segment_%03d.ts");
+
+      fs.mkdir(outputDir, { recursive: true })
+        .then(() => {
+          console.log(`Created HLS directory: ${outputDir}`);
+
+          // Configure ffmpeg command
+          const command = ffmpeg(audioUrl)
+            .audioCodec("aac")
+            .audioBitrate("128k")
+            .audioChannels(2)
+            .audioFrequency(44100)
+            .format("hls")
+            .outputOptions([
+              "-hls_time 10", // 10 second segments
+              "-hls_list_size 0", // Keep all segments in playlist
+              "-hls_segment_filename",
+              segmentPattern,
+              "-hls_flags independent_segments", // Each segment is independent
+              "-hls_segment_type mpegts", // Use MPEG-TS segments
+              "-start_number 0", // Start segment numbering at 0
+              "-hls_allow_cache 1", // Allow caching
+              "-hls_base_url",
+              `./`, // Base URL for segments
+            ])
+            .output(playlistPath);
+
+          let duration = 0;
+
+          // Get duration during processing
+          command.on("codecData", (data) => {
+            console.log(`Audio duration: ${data.duration}`);
+            duration = this._parseDuration(data.duration);
+          });
+
+          command.on("progress", (progress) => {
+            console.log(
+              `HLS conversion progress: ${progress.percent?.toFixed(2) || 0}%`
+            );
+          });
+
+          command.on("end", () => {
+            console.log(`HLS conversion completed for song: ${songId}`);
+
+            const hlsUrl = `/hls/${songId}/playlist.m3u8`;
+
+            resolve({
+              hlsUrl,
+              duration: duration || 0,
+            });
+          });
+
+          command.on("error", (err) => {
+            console.error(`FFmpeg error for song ${songId}:`, err);
+            reject(new Error(`FFmpeg conversion failed: ${err.message}`));
+          });
+
+          command.run();
+        })
+        .catch(reject);
+    });
+  }
+
+  // Parse duration string to milliseconds
+  _parseDuration(durationStr) {
+    if (!durationStr) return 0;
+
+    const timeParts = durationStr.split(":");
+    if (timeParts.length !== 3) return 0;
+
+    const hours = parseInt(timeParts[0]) || 0;
+    const minutes = parseInt(timeParts[1]) || 0;
+    const seconds = parseFloat(timeParts[2]) || 0;
+
+    return (hours * 3600 + minutes * 60 + seconds) * 1000;
+  }
+
+  // Clean up HLS files
+  async _cleanupHLS(songId) {
+    try {
+      const songDir = path.join(this.hlsOutputDir, songId);
+      await fs.rm(songDir, { recursive: true, force: true });
+      console.log(`Cleaned up HLS files for song: ${songId}`);
+    } catch (error) {
+      console.error(`Error cleaning up HLS files for ${songId}:`, error);
+    }
+  }
+
+  async playSong(roomId, songId) {
+    const room = await this.getRoom(roomId);
+    if (!room) {
+      throw new Error("Room not found");
+    }
+
+    if (!room.songs[songId]) {
+      throw new Error("Song not found");
+    }
+
+    const now = Date.now();
+    room.currentSong = songId;
+    room.isPlaying = true;
+    room.songElapsedTime = 0;
+    room.songStartTime = now;
+    room.playbackStartTime = now + 2000; // 2 second buffer for sync
+    room.hlsUrl = room.songs[songId].hlsUrl;
+    room.serverTime = now;
 
     await this.saveRoom(roomId, room);
-    await this.broadcastHLSCommand(room, enable);
-    return enable;
+    await this._broadcastPlaybackSync(roomId, room);
+
+    return {
+      songId,
+      songUrl: room.songs[songId].songUrl,
+      hlsUrl: room.songs[songId].hlsUrl,
+      isPlaying: true,
+      elapsedTime: 0,
+      playbackStartTime: room.playbackStartTime,
+      serverTime: now,
+      duration: room.songs[songId].duration,
+    };
   }
 
-  async broadcastHLSCommand(room, enable) {
-    const payload = {
-      action: enable ? "play" : "pause",
-      serverTime: this.getServerTime(),
-      startTime: room.startTime,
-      elapsedTime: this._getElapsedTimeSync(room),
-      songDuration: room.songDuration,
-      playlistUrl: room.hlsPlaylistUrl,
-      audioUrl: room.audioUrl,
-      spatialEnabled: room.spatialEnabled,
+  async pauseSong(roomId) {
+    const room = await this.getRoom(roomId);
+    if (!room) {
+      throw new Error("Room not found");
+    }
+
+    const now = Date.now();
+    if (room.isPlaying && room.playbackStartTime) {
+      room.songElapsedTime = Math.max(0, now - room.playbackStartTime);
+    }
+
+    room.isPlaying = false;
+    room.songStartTime = null;
+    room.playbackStartTime = null;
+    room.serverTime = now;
+
+    await this.saveRoom(roomId, room);
+    await this._broadcastPlaybackSync(roomId, room);
+
+    return {
+      songId: room.currentSong,
+      isPlaying: false,
+      elapsedTime: room.songElapsedTime,
+      serverTime: now,
+    };
+  }
+
+  async resumeSong(roomId) {
+    const room = await this.getRoom(roomId);
+    if (!room) {
+      throw new Error("Room not found");
+    }
+
+    if (!room.currentSong) {
+      throw new Error("No song to resume");
+    }
+
+    const now = Date.now();
+    room.isPlaying = true;
+    room.songStartTime = now;
+    room.playbackStartTime = now + 1000; // 1 second buffer for resume
+    room.serverTime = now;
+
+    await this.saveRoom(roomId, room);
+    await this._broadcastPlaybackSync(roomId, room);
+
+    return {
+      songId: room.currentSong,
+      songUrl: room.songs[room.currentSong].songUrl,
+      hlsUrl: room.songs[room.currentSong].hlsUrl,
+      isPlaying: true,
+      elapsedTime: room.songElapsedTime,
+      playbackStartTime: room.playbackStartTime,
+      serverTime: now,
+    };
+  }
+
+  async stopSong(roomId) {
+    const room = await this.getRoom(roomId);
+    if (!room) {
+      throw new Error("Room not found");
+    }
+
+    room.currentSong = null;
+    room.isPlaying = false;
+    room.songElapsedTime = 0;
+    room.songStartTime = null;
+    room.playbackStartTime = null;
+    room.hlsUrl = null;
+    room.serverTime = Date.now();
+
+    await this.saveRoom(roomId, room);
+    await this._broadcastPlaybackSync(roomId, room);
+
+    return { stopped: true, serverTime: room.serverTime };
+  }
+
+  // Precise sync broadcasting every 500ms
+  startSyncBroadcast(roomId) {
+    const syncInterval = setInterval(async () => {
+      const room = await this.getRoom(roomId);
+      if (!room || Object.keys(room.clients).length === 0) {
+        clearInterval(syncInterval);
+        this.syncIntervals.delete(roomId);
+        return;
+      }
+
+      if (room.isPlaying && room.currentSong) {
+        await this._broadcastPlaybackSync(roomId, room);
+      }
+    }, 500); // Sync every 500ms
+
+    this.syncIntervals.set(roomId, syncInterval);
+  }
+
+  async _broadcastPlaybackSync(roomId, room) {
+    const now = Date.now();
+    const currentPlaybackTime = this._calculateCurrentPlaybackTime(room);
+
+    const syncData = {
+      songId: room.currentSong,
+      isPlaying: room.isPlaying,
+      playbackStartTime: room.playbackStartTime,
+      currentTime: currentPlaybackTime,
+      serverTime: now,
+      hlsUrl: room.hlsUrl,
     };
 
-    for (const clientId of Object.keys(room.clients)) {
+    const clients = Object.entries(room.clients);
+    for (const [clientId] of clients) {
       const socket = this.sockets.get(clientId);
       if (socket) {
-        socket.emit("hls-command", payload);
+        socket.emit("playback-sync", syncData);
       }
     }
   }
 
-  async toggleSpatialAudio(roomId, enable) {
-    const room = await this.getRoom(roomId);
-    if (!room) return;
-
-    room.spatialEnabled = enable;
-    clearInterval(this.intervals.get(roomId));
-    this.intervals.delete(roomId);
-
-    if (enable) {
-      await this.startSpatialAudio(roomId, room);
-    } else {
-      room.listeningSource = { x: 0, y: 0 };
-      await this.saveRoom(roomId, room);
-      await this.broadcastSpatialUpdate(room);
+  _calculateCurrentPlaybackTime(room) {
+    if (!room.isPlaying || !room.playbackStartTime) {
+      return room.songElapsedTime || 0;
     }
 
-    return enable;
+    const now = Date.now();
+    if (now < room.playbackStartTime) {
+      return room.songElapsedTime || 0;
+    }
+
+    return (room.songElapsedTime || 0) + (now - room.playbackStartTime);
+  }
+
+  async toggleSpatialAudio(roomId, spatialEnable) {
+    const room = await this.getRoom(roomId);
+    if (!room) {
+      return;
+    }
+
+    room.spatialEnabled = spatialEnable;
+
+    if (this.intervals.has(roomId)) {
+      clearInterval(this.intervals.get(roomId));
+      this.intervals.delete(roomId);
+    }
+
+    if (spatialEnable) {
+      await this.startSpatialAudio(roomId, room);
+    } else {
+      room.soundSource = { x: 0, y: 0 };
+      await this.saveRoom(roomId, room);
+      await this.broadCastSpatialUpdate(room);
+    }
   }
 
   async startSpatialAudio(roomId, room) {
     let step = 0;
-    const radius = 100;
+    const radius = RADIUS;
     const center = { x: 0, y: 0 };
     const FRAME_RATE = 100;
 
-    const intervalId = setInterval(async () => {
+    const interval = setInterval(async () => {
       const currentRoom = await this.getRoom(roomId);
       if (!currentRoom || !currentRoom.spatialEnabled) {
-        clearInterval(intervalId);
+        clearInterval(interval);
         this.intervals.delete(roomId);
         return;
       }
 
-      const angle = (step * Math.PI) / 30;
-      currentRoom.listeningSource = {
-        x: center.x + radius * Math.cos(angle),
-        y: center.y + radius * Math.sin(angle),
+      const angle = (step * Math.PI * 2) / 100;
+      currentRoom.soundSource = {
+        x: center.x + Math.cos(angle) * radius,
+        y: center.y + Math.sin(angle) * radius,
       };
 
-      await this.broadcastSpatialUpdate(currentRoom);
-
-      if (step % 30 === 0) {
-        await this.saveRoom(roomId, currentRoom);
-      }
-
-      step = (step + 1) % 60;
+      await this.saveRoom(roomId, currentRoom);
+      await this.broadCastSpatialUpdate(currentRoom);
+      step = (step + 1) % 100;
     }, FRAME_RATE);
 
-    this.intervals.set(roomId, intervalId);
-    await this.saveRoom(roomId, room);
+    this.intervals.set(roomId, interval);
   }
 
   async updateSourcePosition(roomId, position) {
     const room = await this.getRoom(roomId);
-    if (!room) return;
+    if (!room) {
+      return;
+    }
 
-    room.listeningSource = position;
+    room.soundSource = position;
     await this.saveRoom(roomId, room);
-    await this.broadcastSpatialUpdate(room);
-    return room.listeningSource;
+    await this.broadCastSpatialUpdate(room);
   }
 
-  async updateClientPositions(room) {
-    const clientEntries = Object.entries(room.clients);
-    clientEntries.forEach(([id, client], index) => {
-      const angle = (index * 2 * Math.PI) / clientEntries.length;
+  updateClientPositions(room) {
+    const clients = Object.entries(room.clients);
+    clients.forEach(([id, client], index) => {
+      const angle = (index * 2 * Math.PI) / clients.length;
       client.position = {
         x: Math.cos(angle) * RADIUS,
         y: Math.sin(angle) * RADIUS,
@@ -386,16 +570,17 @@ class RoomManager {
     });
   }
 
-  async broadcastSpatialUpdate(room) {
-    const source = room.listeningSource;
+  async broadCastSpatialUpdate(room) {
+    const source = room.soundSource;
+    const clients = Object.entries(room.clients);
     const gains = {};
 
-    for (const [clientId, client] of Object.entries(room.clients)) {
+    for (const [id, client] of clients) {
       if (room.spatialEnabled) {
-        const dist = this._distance(client.position, source);
-        gains[clientId] = this._calculateGain(dist);
+        const dist = this._calculateDistance(client.position, source);
+        gains[id] = this._calculateGain(dist);
       } else {
-        gains[clientId] = 1.0;
+        gains[id] = 1.0;
       }
     }
 
@@ -403,18 +588,12 @@ class RoomManager {
       source,
       gains,
       enabled: room.spatialEnabled,
-      songEnabled: room.songEnabled,
-      elapsedTime: this._getElapsedTimeSync(room),
-      songDuration: room.songDuration,
-      startTime: room.startTime,
-      serverTime: this.getServerTime(),
-      playlistUrl: room.hlsPlaylistUrl,
       positions: Object.fromEntries(
-        Object.entries(room.clients).map(([id, c]) => [id, c.position])
+        clients.map(([id, client]) => [id, client.position])
       ),
     };
 
-    for (const clientId of Object.keys(room.clients)) {
+    for (const [clientId] of clients) {
       const socket = this.sockets.get(clientId);
       if (socket) {
         socket.emit("spatial-update", payload);
@@ -422,57 +601,11 @@ class RoomManager {
     }
   }
 
-  async _sendCompleteStateToClient(socket, room) {
-    const currentTime = this.getServerTime();
-
-    const initialPayload = {
-      songEnabled: room.songEnabled,
-      elapsedTime: this._getElapsedTimeSync(room),
-      songDuration: room.songDuration,
-      startTime: room.startTime,
-      serverTime: currentTime,
-      savedElapsedTime: room.savedElapsedTime,
-      spatialEnabled: room.spatialEnabled,
-      playlistUrl: room.hlsPlaylistUrl,
-      audioUrl: room.audioUrl,
-      sourcePosition: room.listeningSource,
-    };
-
-    socket.emit("initial-sync", initialPayload);
-
-    const gains = {};
-    for (const [clientId, client] of Object.entries(room.clients)) {
-      if (room.spatialEnabled) {
-        const dist = this._distance(client.position, room.listeningSource);
-        gains[clientId] = this._calculateGain(dist);
-      } else {
-        gains[clientId] = 1.0;
-      }
-    }
-
-    const spatialPayload = {
-      source: room.listeningSource,
-      gains,
-      enabled: room.spatialEnabled,
-      songEnabled: room.songEnabled,
-      elapsedTime: this._getElapsedTimeSync(room),
-      songDuration: room.songDuration,
-      startTime: room.startTime,
-      serverTime: currentTime,
-      playlistUrl: room.hlsPlaylistUrl,
-      positions: Object.fromEntries(
-        Object.entries(room.clients).map(([id, c]) => [id, c.position])
-      ),
-    };
-
-    socket.emit("spatial-update", spatialPayload);
-  }
-
   _roomKey(roomId) {
     return `room:${roomId}`;
   }
 
-  _distance(p1, p2) {
+  _calculateDistance(p1, p2) {
     const dx = p1.x - p2.x;
     const dy = p1.y - p2.y;
     return Math.sqrt(dx * dx + dy * dy);
@@ -480,19 +613,9 @@ class RoomManager {
 
   _calculateGain(distance) {
     const maxDistance = RADIUS;
-    const minGain = 0.1;
-
-    if (distance >= maxDistance) return minGain;
-    const gain = 1 - distance / maxDistance;
+    const minGain = 0.5;
+    const gain = 1 - (distance / maxDistance) * (1 - minGain);
     return Math.max(gain, minGain);
-  }
-
-  _getElapsedTimeSync(room) {
-    if (!room) return 0;
-    if (room.songEnabled && room.startTime) {
-      return Math.min(this.getServerTime() - room.startTime, room.songDuration);
-    }
-    return room.savedElapsedTime || 0;
   }
 }
 
